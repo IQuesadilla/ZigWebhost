@@ -4,18 +4,27 @@ const SiteCode = "<html></html>";
 var AcceptMutex: std.Thread.Mutex = .{};
 var ContinueMutex: std.Thread.Mutex = .{};
 
-pub fn HandleClient(InNetResponse: ?*std.http.Server.Response) void {
+const ThreadStatus = enum { Connected, Available, Killed };
+
+const ConnectionData = struct {
+    thread: std.Thread,
+    connection: std.http.Server.Response,
+    status: ThreadStatus,
+};
+
+// An open thread should signal in some way to the running thread that it is
+// available to handle a new connection; this should help eliminate the constant
+// creation and deletion of threads
+
+pub fn HandleClient(InNetResponse: *ConnectionData) void {
     ContinueMutex.lock();
     AcceptMutex.lock();
     ContinueMutex.unlock();
     AcceptMutex.unlock();
 
-    var NetResponse = InNetResponse orelse {
-        std.debug.print("Recieved null pointer, should be impossible\n", .{});
-        return;
-    };
+    var NetResponse = &InNetResponse.connection;
 
-    std.debug.print("Connection opened to {}\n", .{NetResponse.connection.protocol});
+    std.debug.print("Connection opened to {}\n", .{NetResponse.address});
 
     NetResponse.wait() catch |err| {
         std.debug.print("ERROR: {}\n", .{err});
@@ -71,20 +80,15 @@ pub fn ThreadSpawner(NetServer: *std.http.Server) void {
         .allocator = AcceptHeapAlloc.allocator(),
     };
 
-    // TODO: Manage all of the threads
-    // std::vector<std::pair<std::thread,
-    const ConnectionData = struct {
-        thread: std.Thread,
-        connection: std.http.Server.Response,
-    };
-
     const ConnectionsList = std.SinglyLinkedList(ConnectionData);
     var OpenConnections: ConnectionsList = .{};
 
     var ConnectionsAlloc = std.heap.GeneralPurposeAllocator(.{}){};
     defer std.debug.assert(ConnectionsAlloc.deinit() == .ok);
 
-    while (true) {
+    var TempConnectionCount: usize = 5;
+
+    while (TempConnectionCount > 0) {
         AcceptMutex.lock();
 
         var NewConnNode = ConnectionsAlloc.allocator().create(ConnectionsList.Node) catch |err| {
@@ -96,7 +100,7 @@ pub fn ThreadSpawner(NetServer: *std.http.Server) void {
 
         const ThreadConfig: std.Thread.SpawnConfig = .{};
 
-        NewConnNode.data.thread = std.Thread.spawn(ThreadConfig, HandleClient, .{&NewConnNode.data.connection}) catch |err| {
+        NewConnNode.data.thread = std.Thread.spawn(ThreadConfig, HandleClient, .{&NewConnNode.data}) catch |err| {
             std.debug.print("ERROR: {}\n", .{err});
             return;
         };
@@ -116,7 +120,14 @@ pub fn ThreadSpawner(NetServer: *std.http.Server) void {
         ContinueMutex.lock();
         ContinueMutex.unlock();
 
-        //nextConnection.join(); // TODO: Manage the threads rather than wait
+        TempConnectionCount -= 1;
+    }
+
+    while (OpenConnections.len() > 0) {
+        std.debug.print("Connections still open: {}\n", .{OpenConnections.len()});
+        var RemovingNode: *ConnectionsList.Node = OpenConnections.popFirst() orelse break;
+        RemovingNode.data.thread.join();
+        ConnectionsAlloc.allocator().destroy(RemovingNode);
     }
 }
 
@@ -134,10 +145,10 @@ pub fn main() void {
 
     var NetAddr = std.net.Address.resolveIp("0.0.0.0", 3000) catch |err| {
         switch (err) {
-            error.PermissionDenied => { // Just here as an example of handling an individual error
-                std.debug.print("ERROR: {s}\n", .{"PermissionDenied"});
-                return;
-            },
+            //error.PermissionDenied => { // Just here as an example of handling an individual error
+            //    std.debug.print("ERROR: {s}\n", .{"PermissionDenied"});
+            //    return;
+            //},
             else => {
                 std.debug.print("ERROR: {}\n", .{err});
                 return;
