@@ -1,133 +1,84 @@
 const std = @import("std");
 
 const SiteCode = "<html></html>";
-var AcceptMutex: std.Thread.Mutex = .{};
-var ContinueMutex: std.Thread.Mutex = .{};
+//var AcceptMutex: std.Thread.Mutex = .{};
+//var ContinueMutex: std.Thread.Mutex = .{};
+var ServerRunning: bool = true;
+const ConnectionsList = std.SinglyLinkedList(ConnectionData);
+//var SyncLock: std.Thread.ResetEvent = .{};
 
-const ThreadStatus = enum { Connected, Available, Killed };
+const ThreadStatus = enum { Connected, Available, Selected, Killed };
 
 const ConnectionData = struct {
     thread: std.Thread,
     connection: std.http.Server.Response,
     status: ThreadStatus,
+    synclock: std.Thread.ResetEvent,
 };
 
-// An open thread should signal in some way to the running thread that it is
-// available to handle a new connection; this should help eliminate the constant
-// creation and deletion of threads
+pub fn HandleClient(ThreadData: *ConnectionData) void {
+    defer ThreadData.status = ThreadStatus.Killed;
 
-pub fn HandleClient(InNetResponse: *ConnectionData) void {
-    ContinueMutex.lock();
-    AcceptMutex.lock();
-    ContinueMutex.unlock();
-    AcceptMutex.unlock();
-
-    var NetResponse = &InNetResponse.connection;
-
-    std.debug.print("Connection opened to {}\n", .{NetResponse.address});
-
-    NetResponse.wait() catch |err| {
-        std.debug.print("ERROR: {}\n", .{err});
-    };
-
-    //var doReadLoop: bool = true;
-    //while (doReadLoop) {
-    //    NetResponse.read() catch |err| {
-    //        switch (err) {
-    //            else => {
-    //                std.debug.print("ERROR: {}\n", .{err});
-    //                return;
-    //            },
-    //        }
-    //    };
-    //}
-
-    //var AcceptHeapAlloc = std.heap.GeneralPurposeAllocator(.{}){};
-    //defer std.debug.assert(AcceptHeapAlloc.deinit() == .ok);
-
-    const ClientBody = NetResponse.reader().readAllAlloc(NetResponse.allocator, 1024) catch unreachable;
-    std.debug.print("The response body: <{s}>\n", .{ClientBody});
-
-    NetResponse.transfer_encoding = .{
-        .content_length = SiteCode.len,
-    };
-
-    NetResponse.do() catch |err| {
-        std.debug.print("ERROR: {}\n", .{err});
-    };
-
-    _ = NetResponse.write(SiteCode) catch |err| {
-        switch (err) {
-            else => {
-                std.debug.print("ERROR: {}\n", .{err});
-                return;
-            },
-        }
-    };
-
-    NetResponse.finish() catch |err| {
-        std.debug.print("ERROR: {}\n", .{err});
-    };
-
-    NetResponse.deinit();
-}
-
-pub fn ThreadSpawner(NetServer: *std.http.Server) void {
-    var AcceptHeapAlloc = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(AcceptHeapAlloc.deinit() == .ok);
-
-    const AcceptOptions: std.http.Server.AcceptOptions = .{
-        .allocator = AcceptHeapAlloc.allocator(),
-    };
-
-    const ConnectionsList = std.SinglyLinkedList(ConnectionData);
-    var OpenConnections: ConnectionsList = .{};
-
-    var ConnectionsAlloc = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(ConnectionsAlloc.deinit() == .ok);
-
-    var TempConnectionCount: usize = 5;
-
-    while (TempConnectionCount > 0) {
-        AcceptMutex.lock();
-
-        var NewConnNode = ConnectionsAlloc.allocator().create(ConnectionsList.Node) catch |err| {
-            std.debug.print("ERROR: {}\n", .{err});
-            return;
-        };
-
-        OpenConnections.prepend(NewConnNode);
-
-        const ThreadConfig: std.Thread.SpawnConfig = .{};
-
-        NewConnNode.data.thread = std.Thread.spawn(ThreadConfig, HandleClient, .{&NewConnNode.data}) catch |err| {
-            std.debug.print("ERROR: {}\n", .{err});
-            return;
-        };
-
-        NewConnNode.data.connection = NetServer.accept(AcceptOptions) catch |err| {
-            switch (err) {
-                else => {
-                    std.debug.print("ERROR: {}\n", .{err});
+    while (true) {
+        var ContinueWait: bool = true;
+        while (ContinueWait) {
+            var TimedOut: bool = false;
+            ThreadData.synclock.timedWait(std.time.ns_per_min) catch {
+                if (ThreadData.status != ThreadStatus.Selected) {
+                    std.debug.print("Thread timed out\n", .{});
                     return;
-                },
-            }
+                }
+                TimedOut = true;
+            };
+            if (TimedOut == false) ContinueWait = false;
+        }
+        ThreadData.synclock.reset();
+
+        defer {
+            if (ServerRunning) ThreadData.connection.deinit();
+            ThreadData.status = ThreadStatus.Available;
+        }
+
+        if (ServerRunning == false) return;
+
+        std.debug.print("Connection opened to {}\n", .{ThreadData.connection.address});
+
+        ThreadData.connection.wait() catch |err| {
+            std.debug.print("Error - NetResponse.wait: {}\n", .{err});
+            continue;
         };
 
-        //NetResponseOpt = &NewConnNode.data.connection;
-        AcceptMutex.unlock();
+        std.debug.print("The requested path: <{s}>, {}\n", .{ ThreadData.connection.request.target, ThreadData.connection.request.target.len });
+        var Path = std.Uri.parse(ThreadData.connection.request.target) catch |err| {
+            std.debug.print("Error - Uri.parse: {}\n", .{err});
+            continue;
+        };
+        std.debug.print("The request url: <{}>\n", .{Path});
 
-        ContinueMutex.lock();
-        ContinueMutex.unlock();
+        const ClientBody = ThreadData.connection.reader().readAllAlloc(ThreadData.connection.allocator, 1024) catch |err| {
+            std.debug.print("Error - NetResponse.reader.readAllAlloc: {}\n", .{err});
+            continue;
+        };
+        ThreadData.connection.allocator.free(ClientBody);
 
-        TempConnectionCount -= 1;
-    }
+        ThreadData.connection.transfer_encoding = .{
+            .content_length = SiteCode.len,
+        };
 
-    while (OpenConnections.len() > 0) {
-        std.debug.print("Connections still open: {}\n", .{OpenConnections.len()});
-        var RemovingNode: *ConnectionsList.Node = OpenConnections.popFirst() orelse break;
-        RemovingNode.data.thread.join();
-        ConnectionsAlloc.allocator().destroy(RemovingNode);
+        ThreadData.connection.do() catch |err| {
+            std.debug.print("ERROR: {}\n", .{err});
+            continue;
+        };
+
+        _ = ThreadData.connection.write(SiteCode) catch |err| {
+            std.debug.print("ERROR - In NetResponse.write: {}\n", .{err});
+            continue;
+        };
+
+        ThreadData.connection.finish() catch |err| {
+            std.debug.print("Error - In NetResponse.finish: {}\n", .{err});
+            continue;
+        };
     }
 }
 
@@ -168,15 +119,131 @@ pub fn main() void {
             },
         }
     };
+    var AcceptHeapAlloc = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(AcceptHeapAlloc.deinit() == .ok);
 
-    const ThreadConfig: std.Thread.SpawnConfig = .{
-        .allocator = NetHeapAlloc.allocator(),
+    const AcceptOptions: std.http.Server.AcceptOptions = .{
+        .allocator = AcceptHeapAlloc.allocator(),
     };
-    var SpawnerThread = std.Thread.spawn(ThreadConfig, ThreadSpawner, .{&NetServer}) catch |err| {
-        std.debug.print("ERROR: {}\n", .{err});
-        return;
-    };
-    SpawnerThread.join();
+
+    var OpenConnections: ConnectionsList = .{};
+
+    var ConnectionsAlloc = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(ConnectionsAlloc.deinit() == .ok);
+
+    //if (SyncLock.isSet())
+    //    SyncLock.reset();
+    //var ServerLoop: bool = true;
+    while (ServerRunning) {
+        //AcceptMutex.lock();
+
+        var AvailableNode: ?*ConnectionsList.Node = null;
+        { // For - removing "var it" from other scopes
+            var it = OpenConnections.first;
+            while (it) |node| {
+                it = node.next;
+                if (node.data.status == ThreadStatus.Killed) {
+                    OpenConnections.remove(node);
+                    node.data.thread.join();
+                    ConnectionsAlloc.allocator().destroy(node);
+                } else if (node.data.status == ThreadStatus.Available) {
+                    // TODO: Status can change from Available to Killed between these two instructions, causing a crash
+                    node.data.status = ThreadStatus.Selected;
+                    AvailableNode = node;
+                }
+            }
+        }
+
+        if (AvailableNode == null) {
+            var NewConnNode = ConnectionsAlloc.allocator().create(ConnectionsList.Node) catch |err| {
+                std.debug.print("ERROR: {}\n", .{err});
+                return;
+            };
+
+            OpenConnections.prepend(NewConnNode);
+
+            NewConnNode.data.synclock = .{};
+            NewConnNode.data.synclock.set();
+            NewConnNode.data.synclock.reset();
+
+            NewConnNode.data.status = ThreadStatus.Selected;
+
+            const ThreadConfig: std.Thread.SpawnConfig = .{};
+            NewConnNode.data.thread = std.Thread.spawn(ThreadConfig, HandleClient, .{&NewConnNode.data}) catch |err| {
+                std.debug.print("ERROR: {}\n", .{err});
+                return;
+            };
+
+            AvailableNode = NewConnNode;
+        }
+
+        var OperatingNode = AvailableNode orelse return;
+
+        var LinuxSocket = NetServer.socket.sockfd orelse unreachable;
+
+        var AcceptLoop: bool = true;
+        while (AcceptLoop) {
+            var fds = [_]std.os.pollfd{
+                std.os.linux.pollfd{ .fd = LinuxSocket, .events = std.os.linux.POLL.IN, .revents = 0 },
+                std.os.linux.pollfd{ .fd = std.io.getStdIn().handle, .events = std.os.linux.POLL.IN, .revents = 0 },
+            };
+            const nfds = std.os.poll(&fds, 1000) catch |err| {
+                std.debug.print("Error - poll: {}\n", .{err});
+                return;
+            };
+            if (nfds == 0) {
+                var it = OpenConnections.first;
+                while (it) |node| {
+                    it = node.next;
+                    if (node.data.status == ThreadStatus.Killed) {
+                        OpenConnections.remove(node);
+                        node.data.thread.join();
+                        ConnectionsAlloc.allocator().destroy(node);
+                    }
+                }
+                //std.debug.print("Timeout reached, looping\n", .{});
+            } else {
+                if ((fds[0].revents * std.os.linux.POLL.IN) != 0) {
+                    OperatingNode.data.connection = NetServer.accept(AcceptOptions) catch |err| {
+                        switch (err) {
+                            else => {
+                                std.debug.print("ERROR: {}\n", .{err});
+                                return;
+                            },
+                        }
+                    };
+
+                    std.debug.print("Unlocking thread\n", .{});
+                    OperatingNode.data.status = ThreadStatus.Connected;
+                    OperatingNode.data.synclock.set();
+                    //SyncLock.reset();
+
+                    AcceptLoop = false;
+                }
+
+                if ((fds[1].revents * std.os.linux.POLL.IN) != 0) {
+                    var Input = std.io.getStdIn().reader().readUntilDelimiterAlloc(AcceptHeapAlloc.allocator(), '\n', 1024) catch return;
+                    //std.debug.print("Recieved from stdin <{s}>\n", .{Input});
+                    if (std.mem.eql(u8, Input, "quit")) {
+                        std.debug.print("Killing server; Performing cleanup\n", .{});
+                        AcceptLoop = false;
+                        ServerRunning = false;
+                    } else if (std.mem.eql(u8, Input, "tcount")) {
+                        std.debug.print("Current number of child threads: {}\n", .{OpenConnections.len()});
+                    }
+                    AcceptHeapAlloc.allocator().free(Input);
+                }
+            }
+        }
+    }
+
+    while (OpenConnections.len() > 0) {
+        std.debug.print("Threads still open: {}\n", .{OpenConnections.len()});
+        var RemovingNode: *ConnectionsList.Node = OpenConnections.popFirst() orelse break;
+        RemovingNode.data.synclock.set();
+        RemovingNode.data.thread.join();
+        ConnectionsAlloc.allocator().destroy(RemovingNode);
+    }
 }
 
 test "simple test" {
