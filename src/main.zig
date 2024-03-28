@@ -3,17 +3,25 @@ const std = @import("std");
 //const SiteCode = "<html></html>";
 //var AcceptMutex: std.Thread.Mutex = .{};
 //var ContinueMutex: std.Thread.Mutex = .{};
-var ServerRunning: bool = true;
+//var ServerRunning: bool = true;
 const ConnectionsList = std.SinglyLinkedList(ConnectionData);
+const MSG404 = "<html><head></head><body><h1>404</h1></body></html>";
+const WebRootPath = "webroot/";
 //var SyncLock: std.Thread.ResetEvent = .{};
 
 const ThreadStatus = enum { Connected, Available, Selected, Killed };
+
+const ServerStatus = struct {
+    running: bool,
+    webroot: std.fs.Dir,
+};
 
 const ConnectionData = struct {
     thread: std.Thread,
     connection: std.http.Server.Response,
     status: ThreadStatus,
     synclock: std.Thread.ResetEvent,
+    server: *ServerStatus,
 };
 
 pub fn HandleClient(ThreadData: *ConnectionData) void {
@@ -35,11 +43,11 @@ pub fn HandleClient(ThreadData: *ConnectionData) void {
         ThreadData.synclock.reset();
 
         defer {
-            if (ServerRunning) ThreadData.connection.deinit();
+            if (ThreadData.server.running) ThreadData.connection.deinit();
             ThreadData.status = ThreadStatus.Available;
         }
 
-        if (ServerRunning == false) return;
+        if (ThreadData.server.running == false) return;
 
         std.debug.print("Connection opened to {}\n", .{ThreadData.connection.address});
 
@@ -55,6 +63,7 @@ pub fn HandleClient(ThreadData: *ConnectionData) void {
         };
 
         const FilePathString = if (Path.path.len > 1) Path.path[1..] else "index.html";
+        //std.mem.replace(u8, FilePathString, "..", "//", NewFilePathString);
         std.debug.print("The request url: <{s}>\n", .{FilePathString});
 
         const FileOpenFlags: std.fs.File.OpenFlags = .{
@@ -62,7 +71,7 @@ pub fn HandleClient(ThreadData: *ConnectionData) void {
         };
 
         var FileData: []u8 = undefined;
-        var FileHandle = std.fs.cwd().openFile(FilePathString, FileOpenFlags);
+        var FileHandle = ThreadData.server.webroot.openFile(FilePathString, FileOpenFlags);
         if (FileHandle) |OpenedFile| {
             OpenedFile.seekTo(0) catch unreachable;
             FileData = OpenedFile.readToEndAlloc(ThreadData.connection.allocator, 2048) catch |err| {
@@ -71,7 +80,6 @@ pub fn HandleClient(ThreadData: *ConnectionData) void {
             };
         } else |err| {
             std.debug.print("Error in openFile: {}\n", .{err});
-            const MSG404 = "<html><head></head><body><h1>404</h1></body></html>";
             FileData = ThreadData.connection.allocator.alloc(u8, MSG404.len) catch unreachable;
             @memcpy(FileData, MSG404);
         }
@@ -120,6 +128,16 @@ pub fn main() void {
     std.debug.print("CWD: {s}\n", .{CurrentPath});
     NetHeapAlloc.allocator().free(CurrentPath);
 
+    //std.fs.Dir.OpenDirOptions
+    var CurrentStatus: ServerStatus = .{
+        .running = true,
+        .webroot = std.fs.cwd().openDir(WebRootPath, .{}) catch |err| {
+            std.debug.print("Error in openDir: {}\n", .{err});
+            std.debug.print("Could not find webroot - <{s}>\n", .{WebRootPath});
+            return;
+        },
+    };
+
     var NetAddr = std.net.Address.resolveIp("0.0.0.0", 3000) catch |err| {
         switch (err) {
             //error.PermissionDenied => { // Just here as an example of handling an individual error
@@ -145,11 +163,11 @@ pub fn main() void {
             },
         }
     };
-    var AcceptHeapAlloc = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(AcceptHeapAlloc.deinit() == .ok);
+    //var AcceptHeapAlloc = std.heap.GeneralPurposeAllocator(.{}){};
+    //defer std.debug.assert(AcceptHeapAlloc.deinit() == .ok);
 
     const AcceptOptions: std.http.Server.AcceptOptions = .{
-        .allocator = AcceptHeapAlloc.allocator(),
+        .allocator = NetHeapAlloc.allocator(),
     };
 
     var OpenConnections: ConnectionsList = .{};
@@ -160,7 +178,7 @@ pub fn main() void {
     //if (SyncLock.isSet())
     //    SyncLock.reset();
     //var ServerLoop: bool = true;
-    while (ServerRunning) {
+    while (CurrentStatus.running) {
         //AcceptMutex.lock();
 
         var AvailableNode: ?*ConnectionsList.Node = null;
@@ -186,13 +204,17 @@ pub fn main() void {
                 return;
             };
 
-            OpenConnections.prepend(NewConnNode);
-
-            NewConnNode.data.synclock = .{};
+            NewConnNode.data = ConnectionData{
+                .synclock = .{},
+                .status = ThreadStatus.Selected,
+                .server = &CurrentStatus,
+                .thread = undefined,
+                .connection = undefined,
+            };
             NewConnNode.data.synclock.set();
             NewConnNode.data.synclock.reset();
 
-            NewConnNode.data.status = ThreadStatus.Selected;
+            OpenConnections.prepend(NewConnNode);
 
             const ThreadConfig: std.Thread.SpawnConfig = .{};
             NewConnNode.data.thread = std.Thread.spawn(ThreadConfig, HandleClient, .{&NewConnNode.data}) catch |err| {
@@ -248,16 +270,16 @@ pub fn main() void {
                 }
 
                 if ((fds[1].revents * std.os.POLL.IN) != 0) {
-                    var Input = std.io.getStdIn().reader().readUntilDelimiterAlloc(AcceptHeapAlloc.allocator(), '\n', 1024) catch return;
+                    var Input = std.io.getStdIn().reader().readUntilDelimiterAlloc(NetHeapAlloc.allocator(), '\n', 1024) catch return;
                     //std.debug.print("Recieved from stdin <{s}>\n", .{Input});
                     if (std.mem.eql(u8, Input, "quit")) {
                         std.debug.print("Killing server; Performing cleanup\n", .{});
                         AcceptLoop = false;
-                        ServerRunning = false;
+                        CurrentStatus.running = false;
                     } else if (std.mem.eql(u8, Input, "tcount")) {
                         std.debug.print("Current number of child threads: {}\n", .{OpenConnections.len()});
                     }
-                    AcceptHeapAlloc.allocator().free(Input);
+                    NetHeapAlloc.allocator().free(Input);
                 }
             }
         }
