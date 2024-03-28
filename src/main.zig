@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const SiteCode = "<html></html>";
+//const SiteCode = "<html></html>";
 //var AcceptMutex: std.Thread.Mutex = .{};
 //var ContinueMutex: std.Thread.Mutex = .{};
 var ServerRunning: bool = true;
@@ -44,39 +44,61 @@ pub fn HandleClient(ThreadData: *ConnectionData) void {
         std.debug.print("Connection opened to {}\n", .{ThreadData.connection.address});
 
         ThreadData.connection.wait() catch |err| {
-            std.debug.print("Error - NetResponse.wait: {}\n", .{err});
+            std.debug.print("Error in connection.wait: {}\n", .{err});
             continue;
         };
 
-        std.debug.print("The requested path: <{s}>, {}\n", .{ ThreadData.connection.request.target, ThreadData.connection.request.target.len });
-        var Path = std.Uri.parse(ThreadData.connection.request.target) catch |err| {
-            std.debug.print("Error - Uri.parse: {}\n", .{err});
+        const PathString = ThreadData.connection.request.target;
+        var Path = std.Uri.parseWithoutScheme(PathString) catch |err| {
+            std.debug.print("Error in Uri.parse: {}\n", .{err});
             continue;
         };
-        std.debug.print("The request url: <{}>\n", .{Path});
+
+        const FilePathString = if (Path.path.len > 1) Path.path[1..] else "index.html";
+        std.debug.print("The request url: <{s}>\n", .{FilePathString});
+
+        const FileOpenFlags: std.fs.File.OpenFlags = .{
+            .mode = std.fs.File.OpenMode.read_only,
+        };
+
+        var FileData: []u8 = undefined;
+        var FileHandle = std.fs.cwd().openFile(FilePathString, FileOpenFlags);
+        if (FileHandle) |OpenedFile| {
+            OpenedFile.seekTo(0) catch unreachable;
+            FileData = OpenedFile.readToEndAlloc(ThreadData.connection.allocator, 2048) catch |err| {
+                std.debug.print("Error in readFile: {}\n", .{err});
+                continue;
+            };
+        } else |err| {
+            std.debug.print("Error in openFile: {}\n", .{err});
+            const MSG404 = "<html><head></head><body><h1>404</h1></body></html>";
+            FileData = ThreadData.connection.allocator.alloc(u8, MSG404.len) catch unreachable;
+            @memcpy(FileData, MSG404);
+        }
 
         const ClientBody = ThreadData.connection.reader().readAllAlloc(ThreadData.connection.allocator, 1024) catch |err| {
-            std.debug.print("Error - NetResponse.reader.readAllAlloc: {}\n", .{err});
+            std.debug.print("Error in connection.reader.readAllAlloc: {}\n", .{err});
             continue;
         };
         ThreadData.connection.allocator.free(ClientBody);
 
         ThreadData.connection.transfer_encoding = .{
-            .content_length = SiteCode.len,
+            .content_length = FileData.len,
         };
 
         ThreadData.connection.do() catch |err| {
-            std.debug.print("ERROR: {}\n", .{err});
+            std.debug.print("Error in connection.do: {}\n", .{err});
             continue;
         };
 
-        _ = ThreadData.connection.write(SiteCode) catch |err| {
-            std.debug.print("ERROR - In NetResponse.write: {}\n", .{err});
+        _ = ThreadData.connection.write(FileData) catch |err| {
+            std.debug.print("Error in connection.write: {}\n", .{err});
             continue;
         };
+        ThreadData.connection.allocator.free(FileData);
 
         ThreadData.connection.finish() catch |err| {
-            std.debug.print("Error - In NetResponse.finish: {}\n", .{err});
+            std.debug.print("Error in connection.finish: {}\n", .{err});
             continue;
         };
     }
@@ -93,6 +115,10 @@ pub fn main() void {
 
     var NetHeapAlloc = std.heap.GeneralPurposeAllocator(.{}){};
     defer std.debug.assert(NetHeapAlloc.deinit() == .ok);
+
+    const CurrentPath = std.fs.cwd().realpathAlloc(NetHeapAlloc.allocator(), ".") catch unreachable;
+    std.debug.print("CWD: {s}\n", .{CurrentPath});
+    NetHeapAlloc.allocator().free(CurrentPath);
 
     var NetAddr = std.net.Address.resolveIp("0.0.0.0", 3000) catch |err| {
         switch (err) {
@@ -147,7 +173,7 @@ pub fn main() void {
                     node.data.thread.join();
                     ConnectionsAlloc.allocator().destroy(node);
                 } else if (node.data.status == ThreadStatus.Available) {
-                    // TODO: Status can change from Available to Killed between these two instructions, causing a crash
+                    // TODO: Status can change from Available to Killed between these two instructions, causing a race
                     node.data.status = ThreadStatus.Selected;
                     AvailableNode = node;
                 }
@@ -184,8 +210,8 @@ pub fn main() void {
         var AcceptLoop: bool = true;
         while (AcceptLoop) {
             var fds = [_]std.os.pollfd{
-                std.os.linux.pollfd{ .fd = LinuxSocket, .events = std.os.linux.POLL.IN, .revents = 0 },
-                std.os.linux.pollfd{ .fd = std.io.getStdIn().handle, .events = std.os.linux.POLL.IN, .revents = 0 },
+                std.os.pollfd{ .fd = LinuxSocket, .events = std.os.POLL.IN, .revents = 0 },
+                std.os.pollfd{ .fd = std.io.getStdIn().handle, .events = std.os.POLL.IN, .revents = 0 },
             };
             const nfds = std.os.poll(&fds, 1000) catch |err| {
                 std.debug.print("Error - poll: {}\n", .{err});
@@ -203,7 +229,7 @@ pub fn main() void {
                 }
                 //std.debug.print("Timeout reached, looping\n", .{});
             } else {
-                if ((fds[0].revents * std.os.linux.POLL.IN) != 0) {
+                if ((fds[0].revents * std.os.POLL.IN) != 0) {
                     OperatingNode.data.connection = NetServer.accept(AcceptOptions) catch |err| {
                         switch (err) {
                             else => {
@@ -221,7 +247,7 @@ pub fn main() void {
                     AcceptLoop = false;
                 }
 
-                if ((fds[1].revents * std.os.linux.POLL.IN) != 0) {
+                if ((fds[1].revents * std.os.POLL.IN) != 0) {
                     var Input = std.io.getStdIn().reader().readUntilDelimiterAlloc(AcceptHeapAlloc.allocator(), '\n', 1024) catch return;
                     //std.debug.print("Recieved from stdin <{s}>\n", .{Input});
                     if (std.mem.eql(u8, Input, "quit")) {
