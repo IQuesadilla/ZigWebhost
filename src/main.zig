@@ -66,6 +66,17 @@ pub fn HandleClient(ThreadData: *ConnectionData) void {
         //std.mem.replace(u8, FilePathString, "..", "//", NewFilePathString);
         std.debug.print("The request url: <{s}>\n", .{FilePathString});
 
+        var ItCount: usize = @divFloor(FilePathString.len, 2);
+        while (ItCount > 0) {
+            const InnerItCount = ItCount * 2;
+            if (FilePathString[InnerItCount - 1] == '.' and (FilePathString[InnerItCount - 2] == '.' or (InnerItCount < FilePathString.len and FilePathString[InnerItCount] == '.'))) {
+                std.debug.print("Warning: Attempted to access an out of bounds file.\n", .{});
+                break;
+            }
+            ItCount -= 1;
+        }
+        if (ItCount != 0) continue;
+
         const FileOpenFlags: std.fs.File.OpenFlags = .{
             .mode = std.fs.File.OpenMode.read_only,
         };
