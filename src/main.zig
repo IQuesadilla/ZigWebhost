@@ -287,8 +287,31 @@ pub fn main() void {
                         std.debug.print("Killing server; Performing cleanup\n", .{});
                         AcceptLoop = false;
                         CurrentStatus.running = false;
-                    } else if (std.mem.eql(u8, Input, "tcount")) {
-                        std.debug.print("Current number of child threads: {}\n", .{OpenConnections.len()});
+                    } else if (std.mem.eql(u8, Input, "threads")) {
+                        var AvailCount: usize = 0;
+                        var ConnCount: usize = 0;
+                        var SelCount: usize = 0;
+                        var KillCount: usize = 0;
+
+                        var Node = OpenConnections.first;
+                        while (Node) |Conn| {
+                            switch (Conn.data.status) {
+                                ThreadStatus.Available => {
+                                    AvailCount += 1;
+                                },
+                                ThreadStatus.Connected => {
+                                    ConnCount += 1;
+                                },
+                                ThreadStatus.Selected => {
+                                    SelCount += 1;
+                                },
+                                ThreadStatus.Killed => {
+                                    KillCount += 1;
+                                },
+                            }
+                            Node = Conn.next;
+                        }
+                        std.debug.print("Available: {d}, Connected: {d}, Selected: {d}, Killed: {d}\n", .{ AvailCount, ConnCount, SelCount, KillCount });
                     }
                     NetHeapAlloc.allocator().free(Input);
                 }
