@@ -1,127 +1,7 @@
 const std = @import("std");
-
-//const SiteCode = "<html></html>";
-//var AcceptMutex: std.Thread.Mutex = .{};
-//var ContinueMutex: std.Thread.Mutex = .{};
-//var ServerRunning: bool = true;
-const ConnectionsList = std.SinglyLinkedList(ConnectionData);
-const MSG404 = "<html><head></head><body><h1>404</h1></body></html>";
-const WebRootPath = "webroot/";
-//var SyncLock: std.Thread.ResetEvent = .{};
-
-const ThreadStatus = enum { Connected, Available, Selected, Killed };
-
-const ServerStatus = struct {
-    running: bool,
-    webroot: std.fs.Dir,
-};
-
-const ConnectionData = struct {
-    thread: std.Thread,
-    connection: std.http.Server.Response,
-    status: ThreadStatus,
-    synclock: std.Thread.ResetEvent,
-    server: *ServerStatus,
-};
-
-pub fn HandleClient(ThreadData: *ConnectionData) void {
-    defer ThreadData.status = ThreadStatus.Killed;
-
-    while (true) {
-        var ContinueWait: bool = true;
-        while (ContinueWait) {
-            var TimedOut: bool = false;
-            ThreadData.synclock.timedWait(std.time.ns_per_min) catch {
-                if (ThreadData.status != ThreadStatus.Selected) {
-                    std.debug.print("Thread timed out\n", .{});
-                    return;
-                }
-                TimedOut = true;
-            };
-            if (TimedOut == false) ContinueWait = false;
-        }
-        ThreadData.synclock.reset();
-
-        defer {
-            if (ThreadData.server.running) ThreadData.connection.deinit();
-            ThreadData.status = ThreadStatus.Available;
-        }
-
-        if (ThreadData.server.running == false) return;
-
-        std.debug.print("Connection opened to {}\n", .{ThreadData.connection.address});
-
-        ThreadData.connection.wait() catch |err| {
-            std.debug.print("Error in connection.wait: {}\n", .{err});
-            continue;
-        };
-
-        const PathString = ThreadData.connection.request.target;
-        var Path = std.Uri.parseWithoutScheme(PathString) catch |err| {
-            std.debug.print("Error in Uri.parse: {}\n", .{err});
-            continue;
-        };
-
-        const FilePathString = if (Path.path.len > 1) Path.path[1..] else "index.html";
-        //std.mem.replace(u8, FilePathString, "..", "//", NewFilePathString);
-        std.debug.print("The request url: <{s}>\n", .{FilePathString});
-
-        var ItCount: usize = @divFloor(FilePathString.len, 2);
-        while (ItCount > 0) {
-            const InnerItCount = ItCount * 2;
-            if (FilePathString[InnerItCount - 1] == '.' and (FilePathString[InnerItCount - 2] == '.' or (InnerItCount < FilePathString.len and FilePathString[InnerItCount] == '.'))) {
-                std.debug.print("Warning: Attempted to access an out of bounds file.\n", .{});
-                break;
-            }
-            ItCount -= 1;
-        }
-        if (ItCount != 0) continue;
-
-        const FileOpenFlags: std.fs.File.OpenFlags = .{
-            .mode = std.fs.File.OpenMode.read_only,
-        };
-
-        var FileData: []u8 = undefined;
-        var FileHandle = ThreadData.server.webroot.openFile(FilePathString, FileOpenFlags);
-        if (FileHandle) |OpenedFile| {
-            OpenedFile.seekTo(0) catch unreachable;
-            FileData = OpenedFile.readToEndAlloc(ThreadData.connection.allocator, 2048) catch |err| {
-                std.debug.print("Error in readFile: {}\n", .{err});
-                continue;
-            };
-        } else |err| {
-            std.debug.print("Error in openFile: {}\n", .{err});
-            FileData = ThreadData.connection.allocator.alloc(u8, MSG404.len) catch unreachable;
-            @memcpy(FileData, MSG404);
-        }
-
-        const ClientBody = ThreadData.connection.reader().readAllAlloc(ThreadData.connection.allocator, 1024) catch |err| {
-            std.debug.print("Error in connection.reader.readAllAlloc: {}\n", .{err});
-            continue;
-        };
-        ThreadData.connection.allocator.free(ClientBody);
-
-        ThreadData.connection.transfer_encoding = .{
-            .content_length = FileData.len,
-        };
-
-        ThreadData.connection.do() catch |err| {
-            std.debug.print("Error in connection.do: {}\n", .{err});
-            continue;
-        };
-
-        _ = ThreadData.connection.write(FileData) catch |err| {
-            std.debug.print("Error in connection.write: {}\n", .{err});
-            continue;
-        };
-        ThreadData.connection.allocator.free(FileData);
-
-        ThreadData.connection.finish() catch |err| {
-            std.debug.print("Error in connection.finish: {}\n", .{err});
-            continue;
-        };
-    }
-}
+const types = @import("types.zig");
+const clients = @import("thread.zig");
+const term = @import("interface.zig");
 
 pub fn main() void {
     // Prints to stderr (it's a shortcut based on `std.io.getStdErr()`)
@@ -139,8 +19,8 @@ pub fn main() void {
     std.debug.print("CWD: {s}\n", .{CurrentPath});
     NetHeapAlloc.allocator().free(CurrentPath);
 
-    //std.fs.Dir.OpenDirOptions
-    var CurrentStatus: ServerStatus = .{
+    const WebRootPath = "webroot/";
+    var CurrentStatus: types.ServerStatus = .{
         .running = true,
         .webroot = std.fs.cwd().openDir(WebRootPath, .{}) catch |err| {
             std.debug.print("Error in openDir: {}\n", .{err});
@@ -181,7 +61,7 @@ pub fn main() void {
         .allocator = NetHeapAlloc.allocator(),
     };
 
-    var OpenConnections: ConnectionsList = .{};
+    var OpenConnections: types.ConnectionsList = .{};
 
     var ConnectionsAlloc = std.heap.GeneralPurposeAllocator(.{}){};
     defer std.debug.assert(ConnectionsAlloc.deinit() == .ok);
@@ -192,32 +72,32 @@ pub fn main() void {
     while (CurrentStatus.running) {
         //AcceptMutex.lock();
 
-        var AvailableNode: ?*ConnectionsList.Node = null;
+        var AvailableNode: ?*types.ConnectionsList.Node = null;
         { // For - removing "var it" from other scopes
             var it = OpenConnections.first;
             while (it) |node| {
                 it = node.next;
-                if (node.data.status == ThreadStatus.Killed) {
+                if (node.data.status == types.ThreadStatus.Killed) {
                     OpenConnections.remove(node);
                     node.data.thread.join();
                     ConnectionsAlloc.allocator().destroy(node);
-                } else if (node.data.status == ThreadStatus.Available) {
+                } else if (node.data.status == types.ThreadStatus.Available) {
                     // TODO: Status can change from Available to Killed between these two instructions, causing a race
-                    node.data.status = ThreadStatus.Selected;
+                    node.data.status = types.ThreadStatus.Selected;
                     AvailableNode = node;
                 }
             }
         }
 
         if (AvailableNode == null) {
-            var NewConnNode = ConnectionsAlloc.allocator().create(ConnectionsList.Node) catch |err| {
+            var NewConnNode = ConnectionsAlloc.allocator().create(types.ConnectionsList.Node) catch |err| {
                 std.debug.print("ERROR: {}\n", .{err});
                 return;
             };
 
-            NewConnNode.data = ConnectionData{
+            NewConnNode.data = types.ConnectionData{
                 .synclock = .{},
-                .status = ThreadStatus.Selected,
+                .status = types.ThreadStatus.Selected,
                 .server = &CurrentStatus,
                 .thread = undefined,
                 .connection = undefined,
@@ -228,7 +108,7 @@ pub fn main() void {
             OpenConnections.prepend(NewConnNode);
 
             const ThreadConfig: std.Thread.SpawnConfig = .{};
-            NewConnNode.data.thread = std.Thread.spawn(ThreadConfig, HandleClient, .{&NewConnNode.data}) catch |err| {
+            NewConnNode.data.thread = std.Thread.spawn(ThreadConfig, clients.HandleClient, .{&NewConnNode.data}) catch |err| {
                 std.debug.print("ERROR: {}\n", .{err});
                 return;
             };
@@ -254,7 +134,7 @@ pub fn main() void {
                 var it = OpenConnections.first;
                 while (it) |node| {
                     it = node.next;
-                    if (node.data.status == ThreadStatus.Killed) {
+                    if (node.data.status == types.ThreadStatus.Killed) {
                         OpenConnections.remove(node);
                         node.data.thread.join();
                         ConnectionsAlloc.allocator().destroy(node);
@@ -273,7 +153,7 @@ pub fn main() void {
                     };
 
                     std.debug.print("Unlocking thread\n", .{});
-                    OperatingNode.data.status = ThreadStatus.Connected;
+                    OperatingNode.data.status = types.ThreadStatus.Connected;
                     OperatingNode.data.synclock.set();
                     //SyncLock.reset();
 
@@ -281,39 +161,7 @@ pub fn main() void {
                 }
 
                 if ((fds[1].revents * std.os.POLL.IN) != 0) {
-                    var Input = std.io.getStdIn().reader().readUntilDelimiterAlloc(NetHeapAlloc.allocator(), '\n', 1024) catch return;
-                    //std.debug.print("Recieved from stdin <{s}>\n", .{Input});
-                    if (std.mem.eql(u8, Input, "quit")) {
-                        std.debug.print("Killing server; Performing cleanup\n", .{});
-                        AcceptLoop = false;
-                        CurrentStatus.running = false;
-                    } else if (std.mem.eql(u8, Input, "threads")) {
-                        var AvailCount: usize = 0;
-                        var ConnCount: usize = 0;
-                        var SelCount: usize = 0;
-                        var KillCount: usize = 0;
-
-                        var Node = OpenConnections.first;
-                        while (Node) |Conn| {
-                            switch (Conn.data.status) {
-                                ThreadStatus.Available => {
-                                    AvailCount += 1;
-                                },
-                                ThreadStatus.Connected => {
-                                    ConnCount += 1;
-                                },
-                                ThreadStatus.Selected => {
-                                    SelCount += 1;
-                                },
-                                ThreadStatus.Killed => {
-                                    KillCount += 1;
-                                },
-                            }
-                            Node = Conn.next;
-                        }
-                        std.debug.print("Available: {d}, Connected: {d}, Selected: {d}, Killed: {d}\n", .{ AvailCount, ConnCount, SelCount, KillCount });
-                    }
-                    NetHeapAlloc.allocator().free(Input);
+                    term.TermInterface();
                 }
             }
         }
@@ -321,7 +169,7 @@ pub fn main() void {
 
     while (OpenConnections.len() > 0) {
         std.debug.print("Threads still open: {}\n", .{OpenConnections.len()});
-        var RemovingNode: *ConnectionsList.Node = OpenConnections.popFirst() orelse break;
+        var RemovingNode: *types.ConnectionsList.Node = OpenConnections.popFirst() orelse break;
         RemovingNode.data.synclock.set();
         RemovingNode.data.thread.join();
         ConnectionsAlloc.allocator().destroy(RemovingNode);
